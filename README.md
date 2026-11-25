@@ -1,6 +1,6 @@
 # Route 53 + ACM TLS for an ALB-backed app
 
-Setup notes for serving `https://www.akashcloud.online` from 2 VMs behind an
+Setup notes for serving `https://www.akashcloud.online` and `https://akashcloud.online` from 2 VMs behind an
 Application Load Balancer (ALB), with DNS in Route 53 and a free ACM certificate.
 
 > No credentials, account IDs or resource ARNs are recorded here. Placeholders
@@ -18,7 +18,7 @@ Browser --HTTPS:443--> Route 53 (www alias) --> ALB (TLS terminates, ACM cert)
 - Domain registrar: Namecheap (DNS delegated to Route 53)
 - Region: `us-east-1`
 - Load balancer: Application Load Balancer, internet-facing
-- Certificate: ACM wildcard `*.akashcloud.online` (covers `www`, NOT the bare apex)
+- Certificate: ACM cert for `akashcloud.online` + `*.akashcloud.online` (covers apex and `www`)
 
 ## Prerequisites / pre-checks
 
@@ -56,7 +56,7 @@ nslookup -type=NS akashcloud.online 8.8.8.8
 
 ### 3. Request the ACM certificate
 Certificate Manager (**same region as the ALB**, us-east-1) -> Request public cert
-- Domain: `*.akashcloud.online` (add `akashcloud.online` too if the apex is needed)
+- Domains: `akashcloud.online` AND `*.akashcloud.online` (a wildcard alone does not cover the apex)
 - Validation: DNS
 - Click **Create records in Route 53**
 
@@ -86,16 +86,42 @@ aws elbv2 describe-listeners --load-balancer-arn <ALB_ARN> \
 curl -sk -o /dev/null -w "%{http_code}\n" https://<ALB_DNS_NAME>   # 200
 ```
 
-### 5. Create the DNS alias record
+### 5. Create the DNS alias records
 Route 53 -> hosted zone -> Create record
 - Name: `www`
 - Type: A, **Alias** on
 - Target: Alias to Application and Classic Load Balancer -> us-east-1 -> the ALB
 - Evaluate target health: Yes
 
+Repeat with a **blank name** for the apex (`akashcloud.online`), same ALB target.
+CLI equivalent (apex):
+```bash
+aws route53 change-resource-record-sets --hosted-zone-id <ZONE_ID> --change-batch '{
+  "Changes":[{"Action":"UPSERT","ResourceRecordSet":{
+    "Name":"akashcloud.online.","Type":"A",
+    "AliasTarget":{"HostedZoneId":"<ALB_CANONICAL_ZONE_ID>",
+                   "DNSName":"dualstack.<ALB_DNS_NAME>","EvaluateTargetHealth":true}}}]}'
+```
+(`<ALB_CANONICAL_ZONE_ID>` comes from `aws elbv2 describe-load-balancers`
+-> `CanonicalHostedZoneId`.)
+
 Use an Alias (not CNAME): free, and the only option at the apex.
 
-### 6. HTTP:80 listener
+### 6. Apex HTTPS (added later)
+The first certificate was wildcard-only, so the apex failed TLS. Fix:
+1. Request a new cert with both names (same DNS validation CNAME as before, so
+   it validates automatically and becomes Issued within a minute or two):
+   ```bash
+   aws acm request-certificate --domain-name akashcloud.online      --subject-alternative-names "*.akashcloud.online" --validation-method DNS
+   ```
+2. Swap the listener's certificate. `add-listener-certificates` is denied in the
+   lab, but `modify-listener` works:
+   ```bash
+   aws elbv2 modify-listener --listener-arn <HTTPS_LISTENER_ARN>      --certificates CertificateArn=<NEW_ACM_CERT_ARN>
+   ```
+3. Add the apex alias record (step 5). The old wildcard-only cert can be deleted.
+
+### 7. HTTP:80 listener
 Plan was HTTP -> HTTPS redirect (Edit listener -> Redirect to URL, HTTPS, 443,
 301). Instead the HTTP:80 listener was **deleted** (console: Listeners ->
 select HTTP:80 -> Manage listener -> Delete listener).
@@ -104,9 +130,10 @@ Consequence: `http://` gets no response (connection error). Only `https://`
 works. Do not delete the HTTP listener until HTTPS is confirmed working.
 Preferable long-term: keep it with a 301 redirect.
 
-### 7. Final validation
+### 8. Final validation
 ```bash
 curl -I https://www.akashcloud.online      # HTTP/1.1 200 OK, valid certificate
+curl -I https://akashcloud.online          # apex, same
 nslookup www.akashcloud.online 8.8.8.8     # resolves to ALB IPs
 aws elbv2 describe-target-health --target-group-arn <TG_ARN>   # healthy
 ```
@@ -115,8 +142,8 @@ aws elbv2 describe-target-health --target-group-arn <TG_ARN>   # healthy
 | Item | Value |
 |---|---|
 | Hosted zone | `akashcloud.online` (public) |
-| Records | NS, SOA, ACM validation CNAME, `www` A alias -> ALB |
-| Certificate | `*.akashcloud.online`, Issued, DNS-validated |
+| Records | NS, SOA, ACM validation CNAME, `www` and apex A aliases -> ALB |
+| Certificate | `akashcloud.online` + `*.akashcloud.online`, Issued, DNS-validated |
 | ALB listeners | HTTPS:443 only (ACM cert, TLS 1.3 policy) |
 | Targets | 2 VMs healthy on port 80 |
 
@@ -124,8 +151,12 @@ aws elbv2 describe-target-health --target-group-arn <TG_ARN>   # healthy
 - ACM cert must be in the **same region** as the ALB.
 - `route53domains:*` was blocked by an SCP in the lab; hosted zones/records
   still worked. Registration is at Namecheap anyway.
-- Wildcard `*.domain` does **not** cover the bare `domain`. For the apex, add it
-  as a certificate name and create an apex alias record.
+- Wildcard `*.domain` does **not** cover the bare `domain`. Request the cert with
+  both names from the start, and create an apex alias record.
+- Lab IAM denies `AddListenerCertificates`; use `create-listener` /
+  `modify-listener` (certificate passed directly) instead.
+- On Windows, the AWS CLI output has CRLF: pipe through `tr -d ''` before
+  embedding values in JSON, and avoid `/tmp` paths for `file://` arguments.
 - Local DNS resolvers cache old NS records; check with `8.8.8.8`.
 - App behind the ALB sees HTTP; use `X-Forwarded-Proto` for scheme detection.
 - Copy old registrar DNS records before changing name servers.
